@@ -49,14 +49,33 @@ log_fmt = ProgressHandler()
 log_fmt.setFormatter(logging.Formatter("%(asctime)s | %(levelname)s | %(message)s"))
 app_log.addHandler(log_fmt)
 
-http = requests.Session()
-http.headers.update(UA)
-
 work_q = queue.Queue()
+extract_q = queue.Queue()
 history: set[str] = set()
 exit_flag = threading.Event()
 active_count = 0
 counter_lock = threading.Lock()
+
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
+
+
+def create_robust_session():
+    session = requests.Session()
+    session.headers.update(UA)
+    retries = Retry(
+        total=5,
+        backoff_factor=1,
+        status_forcelist=[429, 500, 502, 503, 504],
+        allowed_methods=["GET"],
+    )
+    adapter = HTTPAdapter(max_retries=retries)
+    session.mount("https://", adapter)
+    session.mount("http://", adapter)
+    return session
+
+
+http = create_robust_session()
 
 
 def is_file(text: str) -> bool:
@@ -169,43 +188,60 @@ def worker():
             app_log.error("Worker error: %s", e)
 
 
-def handle_url(url: str, scraper: Optional[PatreonScraper] = None):
+def scraper_worker():
+    app_log.debug("Scraper worker started.")
+    try:
+        with PatreonScraper() as scraper:
+            while not exit_flag.is_set():
+                try:
+                    url = extract_q.get(timeout=1.0)
+                    if url is None:
+                        break
+
+                    app_log.info("🔍 Processing post: %s", url)
+                    links, creator = scraper.get_links_from_post(url)
+
+                    count = 0
+                    for l in links:
+                        if l not in history:
+                            history.add(l)
+                            work_q.put((l, creator))
+                            count += 1
+
+                    if count > 0:
+                        app_log.info(
+                            "✨ [+] Added %d NEW links from %s",
+                            count,
+                            creator or "unknown",
+                        )
+                    elif links:
+                        app_log.info("ℹ️ All links from this post already handled.")
+
+                    extract_q.task_done()
+                except queue.Empty:
+                    continue
+                except Exception as e:
+                    app_log.error("Scraper worker error: %s", e)
+    except Exception as e:
+        app_log.error("Scraper fatal error: %s", e)
+    app_log.debug("Scraper worker stopped.")
+
+
+def handle_url(url: str, force: bool = False):
     url = url.strip()
     if not url:
         return
 
     if is_file(url):
-        if url not in history:
+        if force or url not in history:
             history.add(url)
             work_q.put((url, None))
             app_log.info("🎯 Added file to queue: %s", url)
     elif is_post(url):
-        app_log.info("🔍 Processing post: %s", url)
-        try:
-            if scraper:
-                links, creator = scraper.get_links_from_post(url)
-            else:
-                from extract_links import get_links_from_post
-
-                links, creator = get_links_from_post(url)
-
-            count = 0
-            for l in links:
-                if l not in history:
-                    history.add(l)
-                    work_q.put((l, creator))
-                    count += 1
-
-            if count > 0:
-                app_log.info(
-                    "✨ [+] Added %d NEW links from %s",
-                    count,
-                    creator or "unknown",
-                )
-            elif links:
-                app_log.info("ℹ️ All links from this post already handled.")
-        except Exception as e:
-            app_log.error("❌ Failed to extract from %s: %s", url, e)
+        if force or url not in history:
+            history.add(url)
+            extract_q.put(url)
+            app_log.info("📥 Post queued for extraction: %s", url)
 
 
 def run():
@@ -226,66 +262,87 @@ def run():
         t.start()
         workers.append(t)
 
+    scraper_t = threading.Thread(target=scraper_worker, daemon=True)
+    scraper_t.start()
+
     try:
-        with PatreonScraper() as scraper:
-            for u in args.urls:
-                handle_url(u, scraper)
+        import ctypes
 
-            if args.no_clipboard:
-                app_log.info("🚀 CLI finished. Waiting for downloads...")
-                while not work_q.empty() or active_count > 0:
-                    time.sleep(1.0)
-            else:
-                app_log.info("📋 Watching clipboard... (Ctrl+C to stop)")
-                try:
-                    last = clipboard.paste()
-                except Exception:
-                    last = ""
+        def get_seq():
+            return ctypes.windll.user32.GetClipboardSequenceNumber()
 
-                idle = True
-                status_ts = 0
+    except Exception:
 
-                while not exit_flag.is_set():
+        def get_seq():
+            return 0
+
+    try:
+        for u in args.urls:
+            handle_url(u)
+
+        if args.no_clipboard:
+            app_log.info("🚀 CLI finished. Waiting for downloads...")
+            while not exit_flag.is_set() and (
+                not work_q.empty() or not extract_q.empty() or active_count > 0
+            ):
+                time.sleep(1.0)
+        else:
+            app_log.info("📋 Watching clipboard... (Ctrl+C to stop)")
+
+            last_seq = get_seq()
+            idle = True
+            status_ts = 0
+
+            while not exit_flag.is_set():
+                curr_seq = get_seq()
+
+                if curr_seq != last_seq:
+                    last_seq = curr_seq
                     try:
                         curr = clipboard.paste()
                     except Exception:
                         curr = ""
 
-                    if curr and curr != last:
-                        last = curr
+                    if curr:
                         for p in curr.split():
                             if is_file(p) or is_post(p):
-                                handle_url(p, scraper)
+                                handle_url(p, force=True)
 
-                    q_val = work_q.qsize()
-                    busy = q_val > 0 or active_count > 0
+                q_val = work_q.qsize()
+                ex_val = extract_q.qsize()
+                busy = q_val > 0 or ex_val > 0 or active_count > 0
 
-                    if busy:
-                        idle = False
-                        if time.time() - status_ts > 10:
-                            app_log.info(
-                                "📊 Status: %d in queue, %d active",
-                                q_val,
-                                active_count,
-                            )
-                            status_ts = time.time()
-                    else:
-                        if not idle:
-                            app_log.info("✨ Finished batch! Ready for more... 📋")
-                            idle = True
-                            status_ts = 0
+                if busy:
+                    idle = False
+                    if time.time() - status_ts > 10:
+                        app_log.info(
+                            "📊 Status: %d in queue, %d pulling, %d active",
+                            q_val,
+                            ex_val,
+                            active_count,
+                        )
+                        status_ts = time.time()
+                else:
+                    if not idle:
+                        app_log.info("✨ Finished batch! Ready for more... 📋")
+                        idle = True
+                        status_ts = 0
 
-                    time.sleep(POLL_TIME)
+                time.sleep(POLL_TIME)
 
     except Exception as e:
         if not exit_flag.is_set():
             app_log.error("Main loop error: %s", e)
     finally:
+        exit_flag.set()  # Ensure everyone stops
+        extract_q.put(None)
         for _ in range(THREADS):
             work_q.put(None)
 
         for job in workers:
             job.join(timeout=2.0)
+
+        scraper_t.join(timeout=2.0)
 
         if not exit_flag.is_set() and work_q.empty() and active_count == 0:
             print("\n" + "=" * 50)

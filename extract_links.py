@@ -101,16 +101,19 @@ class PatreonScraper:
                         break
 
                 if not creator:
-                    items = page.eval_on_selector_all(
-                        "a:has(h3)",
-                        "nodes => nodes.map(n => ({href: n.href, text: n.querySelector('h3').innerText}))",
-                    )
-                    for item in items:
-                        h = item["href"]
-                        t = item["text"].strip()
-                        if "/posts/" not in h and "/file?" not in h and t:
-                            creator = t
-                            break
+                    try:
+                        items = page.eval_on_selector_all(
+                            "a:has(h3)",
+                            "nodes => nodes.map(n => ({href: n.href, text: n.querySelector('h3').innerText}))",
+                        )
+                        for item in items:
+                            h = item["href"]
+                            t = item["text"].strip()
+                            if "/posts/" not in h and "/file?" not in h and t:
+                                creator = t
+                                break
+                    except Exception:
+                        pass
 
             except Exception as err:
                 logger.debug("Failed to get creator: %s", err)
@@ -128,16 +131,19 @@ class PatreonScraper:
                         len(links) - prev,
                     )
 
-            full_content = page.content()
-            matches = FILE_PATTERN.findall(full_content)
-            if matches:
-                curr_len = len(links)
-                links.update(matches)
-                if len(links) > curr_len:
-                    logger.info(
-                        "[+] captured %d new file link(s) from page",
-                        len(links) - curr_len,
-                    )
+            try:
+                full_content = page.content()
+                matches = FILE_PATTERN.findall(full_content)
+                if matches:
+                    curr_len = len(links)
+                    links.update(matches)
+                    if len(links) > curr_len:
+                        logger.info(
+                            "[+] captured %d new file link(s) from page",
+                            len(links) - curr_len,
+                        )
+            except Exception:
+                pass
 
         except Exception as e:
             logger.error("Error: %s", e)
